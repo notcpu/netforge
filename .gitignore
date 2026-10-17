@@ -1,0 +1,32 @@
+# byte-compiled
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# run artifacts
+*.pt
+*.pt.bak
+*.meta.json
+*.run.json
+*.log
+netforge_error.log
+data/*
+!data/.gitkeep
+shots/*
+!shots/1_model.png
+!shots/3_data.png
+!shots/4_train.png
+!shots/5_memory.png
+!shots/6_browser.png
+!shots/.gitkeep
+
+# downloaded corpora
+*.ids.pt
+.cache/
+
+# editors / os
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
