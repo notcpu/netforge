@@ -9,6 +9,7 @@ __pycache__/
 *.meta.json
 *.run.json
 *.log
+*.json
 netforge_error.log
 data/*
 !data/.gitkeep
