@@ -5,7 +5,7 @@ with an analytic memory model you can query before you allocate anything.
 
 ![model tab](shots/1_model.png)
 
-Inspired by [`tinyllm`](../../Experiments/tinyllm) — same flat-module layout,
+Inspired by [`tinyllm`](https://github.com/notcpu/tinyllm) — same flat-module layout,
 same `run_cfg`-as-single-source-of-truth idea, same defensive
 `try/except: pass` everywhere — but built around three things tinyllm does not
 have: a second model family for genuinely tiny nets, a memory model you drive
