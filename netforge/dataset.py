@@ -763,6 +763,8 @@ def _local_validation_eval(data_dir, tok, meta, data_cfg, eval_cap, log):
             max_tokens=eval_cap, split_filter={"validation"})
     except Exception as exc:
         append_debug(f"no validation files for eval: {exc}")
+        log("  eval: no validation files on disk - a holdout will be "
+            "carved from the corpus tail")
         return None, "none"
     if ev.numel() < 2048:
         return None, "none"
@@ -788,6 +790,8 @@ def _hf_validation_eval(hf_id, tok, data_cfg, eval_cap, log):
     cands = [s for s in splits
              if split_of(s) == "validation" and s != train_split]
     if not cands:
+        log("  eval: no validation split in this repo - a holdout will be "
+            "carved from the corpus tail")
         return None, "none"
     try:
         ev, emeta, _ = stream_hf_tokens(
@@ -815,13 +819,17 @@ def _tab_holdout(X, y):
     return X, y, None, None, "none"
 
 
-def prepare(run, log=append_error, progress_cb=None):
+def prepare(run, log=append_error, progress_cb=None, tokenizer=None):
     """Build everything training needs. Returns a dict; never raises.
 
     {
       kind:  'text' | 'tabular',
       data / X / y, tokenizer (text only), n_tokens, meta
     }
+
+    `tokenizer`, when given, is used as-is instead of training a fresh one -
+    a resumed run must keep the checkpoint's vocabulary, or every embedding
+    row lands on the wrong token.
     """
     data_cfg = run.get("data", {})
     task = data_cfg.get("task", "synthetic")
@@ -900,17 +908,28 @@ def prepare(run, log=append_error, progress_cb=None):
 
     if hf_id:
         if want_bpe:
-            # BPE needs the text, so this is the one branch that keeps a
-            # corpus in memory - capped the same way, and only for as long as
-            # it takes to learn the merges
-            probe = CharTokenizer()
-            _, meta, sample = do_hf(probe, int(run.get("tokenizer", {})
-                                                .get("max_corpus_chars", 256000)),
-                                     True)
-            del sample
-            tok = build_tokenizer(run.get("tokenizer", {}), "")
-            if not tok.merges:
-                tok = CharTokenizer()
+            tcfg = run.get("tokenizer", {})
+            if tokenizer is not None:
+                tok = tokenizer
+            else:
+                # BPE needs the text, so this is the one branch that keeps a
+                # corpus in memory - capped the same way, and only for as long
+                # as it takes to learn the merges
+                probe = CharTokenizer()
+                _, meta, sample = do_hf(probe,
+                                        int(tcfg.get("max_corpus_chars",
+                                                     256000)),
+                                        True)
+                tok = build_tokenizer(tcfg, sample)
+                req = int(tcfg.get("vocab_size", 8000) or 8000)
+                if not tok.merges:
+                    log(f"  bpe: corpus produced no merges - "
+                        f"falling back to a char tokenizer")
+                    tok = CharTokenizer()
+                else:
+                    log(f"  bpe: trained vocab {tok.vocab_size:,} "
+                        f"(requested {req:,})")
+                del sample
             data, meta, _ = do_hf(tok, cap_tokens, False)
         else:
             tok = CharTokenizer()
@@ -919,34 +938,40 @@ def prepare(run, log=append_error, progress_cb=None):
             hf_id, tok, data_cfg, eval_cap, log)
     else:
         data_dir = data_cfg.get("data_dir", "data")
+        meta = {}
         if want_bpe:
-            probe = CharTokenizer()
-            _, meta, sample = stream_local_tokens(
-                data_dir, probe,
-                field=data_cfg.get("hf_field", ""),
-                max_rows=int(data_cfg.get("max_rows", 0) or 0),
-                max_gb=float(data_cfg.get("max_gb", 0) or 0),
-                max_tokens=int(run.get("tokenizer", {})
-                               .get("max_corpus_chars", 256000)),
-                progress_cb=progress_cb, keep_text=True, cache_txt_path=None)
-            del sample
-            tok = build_tokenizer(run.get("tokenizer", {}), "")
-            if not tok.merges:
-                tok = CharTokenizer()
-            data, meta, _ = stream_local_tokens(
-                data_dir, tok, field=meta.get("field", ""),
-                max_rows=int(data_cfg.get("max_rows", 0) or 0),
-                max_gb=float(data_cfg.get("max_gb", 0) or 0),
-                max_tokens=cap_tokens, progress_cb=progress_cb,
-                keep_text=False, cache_txt_path=cache_txt)
+            tcfg = run.get("tokenizer", {})
+            if tokenizer is not None:
+                tok = tokenizer
+            else:
+                probe = CharTokenizer()
+                _, meta, sample = stream_local_tokens(
+                    data_dir, probe,
+                    field=data_cfg.get("hf_field", ""),
+                    max_rows=int(data_cfg.get("max_rows", 0) or 0),
+                    max_gb=float(data_cfg.get("max_gb", 0) or 0),
+                    max_tokens=int(tcfg.get("max_corpus_chars", 256000)),
+                    progress_cb=progress_cb, keep_text=True,
+                    cache_txt_path=None)
+                tok = build_tokenizer(tcfg, sample)
+                req = int(tcfg.get("vocab_size", 8000) or 8000)
+                if not tok.merges:
+                    log(f"  bpe: corpus produced no merges - "
+                        f"falling back to a char tokenizer")
+                    tok = CharTokenizer()
+                else:
+                    log(f"  bpe: trained vocab {tok.vocab_size:,} "
+                        f"(requested {req:,})")
+                del sample
         else:
             tok = CharTokenizer()
-            data, meta, _ = stream_local_tokens(
-                data_dir, tok, field=data_cfg.get("hf_field", ""),
-                max_rows=int(data_cfg.get("max_rows", 0) or 0),
-                max_gb=float(data_cfg.get("max_gb", 0) or 0),
-                max_tokens=cap_tokens, progress_cb=progress_cb,
-                keep_text=False, cache_txt_path=cache_txt)
+        data, meta, _ = stream_local_tokens(
+            data_dir, tok,
+            field=meta.get("field", "") or data_cfg.get("hf_field", ""),
+            max_rows=int(data_cfg.get("max_rows", 0) or 0),
+            max_gb=float(data_cfg.get("max_gb", 0) or 0),
+            max_tokens=cap_tokens, progress_cb=progress_cb,
+            keep_text=False, cache_txt_path=cache_txt)
         log(f"  {meta.get('source', '?')}: {meta.get('rows', 0):,} rows, "
             f"{meta.get('bytes', 0) / 1024 ** 2:.1f} MB "
             f"({meta.get('stopped_because', '?')})")
@@ -956,16 +981,18 @@ def prepare(run, log=append_error, progress_cb=None):
     log(f"tokenized: {data.numel():,} tokens, vocab {tok.vocab_size:,}")
     return _text_bundle(data, tok, mcfg, meta, cap_tokens,
                         eval_cap=eval_cap,
-                        eval_data=eval_data, eval_source=eval_source)
+                        eval_data=eval_data, eval_source=eval_source,
+                        log=log)
 
 
 def _text_bundle(data, tok, mcfg, meta, cap_tokens, eval_cap=0,
-                 eval_data=None, eval_source="none"):
+                 eval_data=None, eval_source="none", log=None):
     vocab = tok.vocab_size
     mcfg = dict(mcfg)
     if int(mcfg.get("vocab_size", 0)) != vocab:
-        append_debug(f"model vocab {mcfg.get('vocab_size')} != tokenizer "
-                     f"{vocab}; using {vocab}")
+        msg = (f"model vocab {mcfg.get('vocab_size')} != tokenizer "
+               f"{vocab}; using {vocab}")
+        (log or append_debug)(msg)
         mcfg["vocab_size"] = vocab
     n = int(data.numel())
     if cap_tokens and n > cap_tokens:
@@ -978,6 +1005,9 @@ def _text_bundle(data, tok, mcfg, meta, cap_tokens, eval_cap=0,
         # and eval falls back to train batches (old behaviour).
         eval_data, data = data[n - eval_cap:], data[:n - eval_cap]
         eval_source = "tail"
+        if log:
+            log(f"  eval: {eval_cap:,} tokens carved from the corpus tail "
+                f"as a held-out set")
         n = int(data.numel())
     elif eval_data is not None:
         eval_source = eval_source if eval_source != "none" else "files"

@@ -23,7 +23,7 @@ import torch
 from . import arch as arch_mod
 from . import dataset as ds_mod
 from . import memory as mem_mod
-from .checkpoint import load_ckpt, restore_rng, resume_into, save_ckpt
+from .checkpoint import load_ckpt, peek_tokenizer, restore_rng, resume_into, save_ckpt
 from .config import validate_run_cfg
 from .device_utils import (autocast_ctx, device_name, gpu_mem, maybe_pin_to_device,
                            pick_device, set_threads, sync)
@@ -31,6 +31,7 @@ from .logging_utils import append_debug, append_error, append_log
 from .lr_schedule import SchedulerState
 from .model import build_model, unwrap
 from .state import state
+from .tokenizer import tokenizer_from_config
 
 SAMPLE_PROMPTS = ["The", "Once upon", "Hello", "In the", "def ",
                   "### Instruction:\n", "Once", "She"]
@@ -134,6 +135,28 @@ def _train_impl(run, on_done=None):
     dev = pick_device(rcfg.get("device", "auto"))
     set_threads(rcfg.get("max_threads", 0))
 
+    # A checkpoint's embedding rows are indexed by tokenizer ids, so resuming
+    # with a freshly re-trained vocabulary silently re-initialises (or worse,
+    # mis-aligns) them. When the configured checkpoint already carries a
+    # tokenizer of the same family, reuse it instead of training a new one.
+    ckpt_path = rcfg.get("checkpoint", "netforge_run.pt")
+    rest_tok = None
+    if rcfg.get("resume", True) and (os.path.exists(ckpt_path) or
+                                     os.path.exists(ckpt_path + ".bak")):
+        ck_tcfg = peek_tokenizer(ckpt_path)
+        if isinstance(ck_tcfg, dict):
+            ck_kind = str(ck_tcfg.get("type", "char")).lower()
+            if ck_kind == ds_mod.tok_cfg_type(run):
+                rest_tok = tokenizer_from_config(ck_tcfg)
+                if rest_tok is not None:
+                    state.log(f"tokenizer restored from "
+                              f"{os.path.basename(ckpt_path)}: "
+                              f"{rest_tok.vocab_size:,} tokens")
+            else:
+                state.log(f"checkpoint tokenizer is {ck_kind}, config asks "
+                          f"for {ds_mod.tok_cfg_type(run)} - training a "
+                          f"fresh one (its vocab will change on resume)")
+
     state.publish(status="loading data", device=device_name(dev),
                   total_steps=int(tcfg.get("steps", 2000)))
 
@@ -147,7 +170,8 @@ def _train_impl(run, on_done=None):
         elif a:
             state.log(f"[data] {a[0]}")
 
-    bundle = ds_mod.prepare(run, log=state.log, progress_cb=progress)
+    bundle = ds_mod.prepare(run, log=state.log, progress_cb=progress,
+                            tokenizer=rest_tok)
 
     # The corpus may have trained a tokenizer that changed the vocab size.
     mcfg.update(bundle.get("model_cfg_override") or {})
@@ -161,8 +185,9 @@ def _train_impl(run, on_done=None):
     state.publish(n_params=actual, model_name=describe_model(mcfg, actual))
 
     if abs(actual - raw_params) > max(8, 0.001 * max(1, actual)):
-        append_debug(f"analytic estimate {raw_params:,} != actual {actual:,} "
-                     f"({100 * (actual - raw_params) / max(1, actual):+.2f}%)")
+        append_log(f"param recount {actual:,} vs analytic estimate "
+                   f"{raw_params:,} "
+                   f"({100 * (actual - raw_params) / max(1, actual):+.2f}%)")
 
     if not is_text:
         # an MLP's input width must match the data

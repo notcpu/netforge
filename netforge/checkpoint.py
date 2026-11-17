@@ -117,6 +117,7 @@ def save_ckpt(path, model, optimizer=None, scheduler=None, step=0, run_cfg=None,
                 "step": int(step),
                 "n_params": int(total),
                 "model_cfg": payload["model_cfg"],
+                "tokenizer": payload["tokenizer"],
                 "format": 2,
                 "bytes": os.path.getsize(path),
             })
@@ -138,6 +139,36 @@ def _write_sidecar(path, meta):
         os.replace(tmp, _sidecar_path(path))
     except Exception:
         pass
+
+
+def peek_tokenizer(path):
+    """The tokenizer config stored in a checkpoint, without loading tensors.
+
+    Reads the `.meta.json` sidecar when present (new checkpoints); falls back
+    to a `weights_only=True` mmap load for older files whose sidecar predates
+    the tokenizer entry. Returns None when there is nothing usable - never
+    raises.
+    """
+    side = _sidecar_path(path)
+    if os.path.exists(side):
+        try:
+            import json
+            with open(side, "r", encoding="utf-8") as fh:
+                meta = json.load(fh)
+            tok = meta.get("tokenizer")
+            if isinstance(tok, dict):
+                return tok
+        except Exception:
+            pass
+    if not os.path.exists(path):
+        return None
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True,
+                             mmap=True)
+        tok = (payload or {}).get("tokenizer")
+        return tok if isinstance(tok, dict) else None
+    except Exception:
+        return None
 
 
 def load_ckpt(path, map_location="cpu"):

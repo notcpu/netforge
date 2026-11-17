@@ -35,14 +35,14 @@
     ],
     "tokenizer_file": "",
     "train_from_corpus": true,
-    "max_corpus_chars": 256000
+    "max_corpus_chars": 4000000
   },
   "data": {
     "task": "text",
     "synth": "sin",
     "synth_n": 20000,
     "synth_noise": 0.02,
-    "data_dir": "data\\pretrain\\general",
+    "data_dir": "data\\pretrain\\ultra\\",
     "max_tokens": 0,
     "tokens_per_param": 20,
     "bytes_per_token": 0.0,

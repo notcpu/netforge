@@ -300,8 +300,12 @@ grab made a correctly-laid-out form look like it was overflowing.
 - Multi-GPU sharding is *modelled* (the memory report divides correctly) but
   not *executed* — there is no distributed launcher. Use Accelerate/FSDP.
 - `fused=True` in the optimizer config needs CUDA.
-- BPE training is O(merges × corpus); it is capped at `max_corpus_chars`
-  (256K default) because a full-corpus BPE in pure Python is minutes of CPU.
+- BPE training is incremental (pair postings + a lazy heap, `max_count`-style),
+  so a full-corpus pass in pure Python is seconds rather than minutes; the
+  corpus given to it is still capped at `max_corpus_chars` (4M default) and
+  merges stop early when the corpus is too repetitive to learn more.
+- Resumed runs reuse the tokenizer stored inside the checkpoint (also in the
+  `.meta.json` sidecar), so embedding ids cannot drift between runs.
 - Download progress is per-file, not per-byte — `hf_hub_download` gives no
   intra-file callback. The status line names the file in flight so a 1.9 GB
   shard is at least never a mystery.

@@ -22,6 +22,7 @@ BPE learns from adjacent-pair statistics, and striding the corpus destroys
 exactly the adjacency it is trying to count.
 """
 
+import heapq
 import json
 import os
 import re
@@ -168,15 +169,26 @@ class BPETokenizer:
         `max_chars` caps the corpus by taking evenly-spaced *contiguous*
         blocks. Striding single characters would look cheaper and is wrong -
         it destroys the adjacent-pair statistics BPE is trying to learn.
+
+        The merge loop is incremental: pair frequencies are kept in a dict with
+        a word -> pairs posting index, and the max pair comes off a heap. The
+        naive version recomputed every pair count for every merge, which is
+        O(merges x corpus) - fine for 100 merges, an hour of CPU for 8000.
+        Same ordering rules as the naive loop, so merges match the old trainer:
+        highest frequency wins, ties break on the lexically smallest pair.
+        Stale heap entries are rejected by re-checking the live count.
         """
+        import heapq
+
         vocab_size = int(vocab_size)
         if vocab_size <= len(self.specials) + 256:
             return self          # 256 raw bytes already fill it; no merges fit
         text = _sample_contiguous(text, max_chars)
-        target_merges = max(0, vocab_size - len(self.specials) - 256)
+        target_merges = vocab_size - len(self.specials) - 256
 
+        # unique words: one entry per distinct word, with its corpus count
         chunks = _WORD_RE.findall(text)
-        words = {}
+        words, word_count, word_index = [], [], {}
         for c in chunks:
             # latin-1 view so a "symbol" here is exactly one byte, and the
             # merge pairs below are strings that _bpe() can look up directly
@@ -184,47 +196,77 @@ class BPETokenizer:
             if len(b) < 2:
                 continue
             key = tuple(b)
-            words[key] = words.get(key, 0) + 1
+            wid = word_index.get(key)
+            if wid is None:
+                wid = len(words)
+                word_index[key] = wid
+                words.append(b)
+                word_count.append(0)
+            word_count[wid] += 1
+        del chunks, text
 
-        target_merges = vocab_size - len(self.specials) - 256
+        pair_counts = {}          # pair -> weighted count across words
+        postings = {}             # pair -> set of word ids containing it
+        for wid, w in enumerate(words):
+            cnt = word_count[wid]
+            for i in range(len(w) - 1):
+                p = (w[i], w[i + 1])
+                pair_counts[p] = pair_counts.get(p, 0) + cnt
+                postings.setdefault(p, set()).add(wid)
+
+        heap = [(-c, p) for p, c in pair_counts.items()]
+        heapq.heapify(heap)
+
         merges = []
-        for _ in range(target_merges):
-            freq = {}
-            for word, c in words.items():
-                if len(word) < 2:
-                    continue
-                for i in range(len(word) - 1):
-                    p = (word[i], word[i + 1])
-                    freq[p] = freq.get(p, 0) + c
-            if not freq:
-                break
-            best_freq = max(freq.values())
-            if best_freq < min_count:
-                break
-            # deterministic tie-break: smallest pair in tuple order
-            best = min(p for p, c in freq.items() if c == best_freq)
-            merges.append(best)
-
-            merged, n = {}, 0
-            for word, c in words.items():
-                new_word, i = [], 0
-                while i < len(word):
-                    if (i < len(word) - 1 and
-                            (word[i], word[i + 1]) == best):
-                        new_word.append(word[i] + word[i + 1])
-                        i += 2
-                    else:
-                        new_word.append(word[i])
-                        i += 1
-                key = tuple(new_word)
-                merged[key] = merged.get(key, 0) + c
-                n += c
-            words = merged
+        while len(merges) < target_merges and heap:
+            negf, pair = heapq.heappop(heap)
+            freq = pair_counts.get(pair, 0)
+            if freq != -negf:
+                continue                       # stale: count changed since push
+            if freq < min_count:
+                break                          # nothing worth learning left
+            a, b = pair
+            merges.append(pair)
             if verbose:
                 print(f"  merge {len(merges)}/{target_merges}: "
-                      f"{best[0]!r}+{best[1]!r} ({best_freq})")
-            if n == 0:
-                break
+                      f"{a!r}+{b!r} ({freq})")
+
+            touched = set()        # every pair whose live count changed
+            for wid in sorted(postings.pop(pair, ())):
+                w = words[wid]
+                cnt = word_count[wid]
+                new_w, i, n_sym = [], 0, len(w)
+                while i < n_sym:
+                    if i < n_sym - 1 and w[i] == a and w[i + 1] == b:
+                        new_w.append(a + b)
+                        i += 2
+                    else:
+                        new_w.append(w[i])
+                        i += 1
+                if len(new_w) == len(w):
+                    continue                   # pair not here after all
+                # retire this word's old pair contributions, then re-add the
+                # merged shape's - only words containing the pair are touched
+                for j in range(len(w) - 1):
+                    p = (w[j], w[j + 1])
+                    pair_counts[p] -= cnt
+                    touched.add(p)
+                    s = postings.get(p)
+                    if s is not None:
+                        s.discard(wid)
+                words[wid] = new_w
+                for j in range(len(new_w) - 1):
+                    p = (new_w[j], new_w[j + 1])
+                    pair_counts[p] = pair_counts.get(p, 0) + cnt
+                    touched.add(p)
+                    postings.setdefault(p, set()).add(wid)
+            # re-queue the final count of every changed pair. Pushing only the
+            # re-added pairs would let a pair whose count merely DROPPED keep
+            # a stale-high entry and be skipped while it is still the true max
+            for p in touched:
+                c = pair_counts.get(p, 0)
+                if c > 0:
+                    heapq.heappush(heap, (-c, p))
 
         self.merges = merges
         self._rebuild()
@@ -269,6 +311,28 @@ def build_tokenizer(tcfg, corpus_text=""):
                       max_chars=int(tcfg.get("max_corpus_chars", 256000)))
         return tok
     return CharTokenizer()
+
+
+def tokenizer_from_config(cfg):
+    """Rebuild a tokenizer from a `.to_config()` dict. None when unusable.
+
+    Used to restore the tokenizer that a checkpoint was trained with, so a
+    resumed run cannot drift to a differently numbered vocabulary - embedding
+    rows are indexed by tokenizer ids, and ids are the only contract.
+    """
+    if not isinstance(cfg, dict):
+        return None
+    kind = str(cfg.get("type", "bpe")).lower()
+    try:
+        if kind == "char":
+            return CharTokenizer(specials=cfg.get("specials"))
+        merges = cfg.get("merges")
+        if not isinstance(merges, list):
+            return None
+        return BPETokenizer(merges=[tuple(m) for m in merges],
+                            specials=cfg.get("specials"))
+    except Exception:
+        return None
 
 
 def _sample_contiguous(text, max_chars):
